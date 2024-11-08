@@ -1,4 +1,3 @@
-# Robotik-Proje
 # Mountain Car ve Car Racing Algoritmaları
 
 ## Proje Ekibi:
