@@ -1,8 +1,8 @@
 # Mountain Car ve Car Racing Algoritmaları
 
 ## Proje Ekibi:
-- **Yunus Meriç**
-- **Edanur Yıldız**
+- **Yunus Meriç**  032290023
+- **Edanur Yıldız**  032190078
 
 ## Proje Açıklaması:
 Bu proje, robotik dersi kapsamında, *Reinforcement Learning* (pekiştirmeli öğrenme) algoritmalarını kullanarak Mountain Car ve Car Racing oyunlarına yönelik çözümler geliştirmeyi amaçlamaktadır. Projede, üç farklı algoritma olan **DQN** (Deep Q-Network), **A2C** (Advantage Actor-Critic) ve **PPO** (Proximal Policy Optimization) yöntemleri uygulanarak performans karşılaştırmaları yapılacaktır.
