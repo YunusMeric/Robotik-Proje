@@ -1,182 +1,180 @@
+
+# Gerekli kütüphanelerin yüklenmesi
 import gym
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
+from torch import nn
+import torch.nn.functional as F
+from torch.optim import Adam
 from collections import deque
-import matplotlib.pyplot as plt  # Grafik çizimi için eklendi
+import random
+import matplotlib.pyplot as plt
+from matplotlib import rc
+from IPython.display import HTML
+import matplotlib.animation as animation
+from IPython.display import display
 
-# Hiperparametreler
-seed = 123
-gamma = 0.99
-learning_rate = 1e-3
-num_episodes = 5000  # 5000 episode
-max_steps_per_episode = 200
-batch_size = 64
-update_interval = 10
 
-# Ortamı başlat ve seed ayarla
-env = gym.make("MountainCar-v0")
-env.action_space.seed(seed)
-env.observation_space.seed(seed)
-np.random.seed(seed)
-torch.manual_seed(seed)
 
-# PPO için politika ağı
-class PolicyNetwork(nn.Module):
+# Cuda varsa GPU kullanımı, yoksa CPU kullanımı
+torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+# Q-Ağının (Deep Q-Network) modelinin tanımlanması
+class DQN(nn.Module):
     def __init__(self, input_dim, output_dim):
-        super(PolicyNetwork, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, output_dim)
-        self.softmax = nn.Softmax(dim=-1)
+        super(DQN, self).__init__()
+        # Girdi boyutuna göre 3 katmanlı tam bağlantılı bir ağ
+        self.fc1 = nn.Linear(input_dim, 256)  # İlk katman
+        self.fc2 = nn.Linear(256, 128)        # İkinci katman
+        self.fc3 = nn.Linear(128, output_dim) # Çıkış katmanı
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        x = self.softmax(self.fc3(x))
+        x = F.relu(self.fc1(x.to(self.device)))  # İlk katman
+        x = F.relu(self.fc2(x.to(self.device)))  # İkinci katman
+        x = self.fc3(x.to(self.device))         # Çıkış katmanı
         return x
 
-# PPO için değer ağı
-class ValueNetwork(nn.Module):
-    def __init__(self, input_dim):
-        super(ValueNetwork, self).__init__()
-        self.fc1 = nn.Linear(input_dim, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, 1)
 
-    def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        x = self.fc3(x)
-        return x
 
-# Ağları ve optimizasyonu tanımla
-obs_dim = env.observation_space.shape[0]
-action_dim = env.action_space.n
+# Deneyim Belleği (Replay Buffer)
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
 
-policy_net = PolicyNetwork(obs_dim, action_dim)
-value_net = ValueNetwork(obs_dim)
+    # Yeni bir deneyimi ekleme
+    def push(self, state, action, reward, next_state, done):
+        self.buffer.append((state, action, reward, next_state, done))
 
-policy_optimizer = optim.Adam(policy_net.parameters(), lr=learning_rate)
-value_optimizer = optim.Adam(value_net.parameters(), lr=learning_rate)
+    # Deneyimlerden rastgele bir örnek seçme
+    def sample(self, batch_size):
+        state, action, reward, next_state, done = zip(*random.sample(self.buffer, batch_size))
+        return np.array(state), action, reward, np.array(next_state), done
 
-# PPO için kayıp fonksiyonu
-def compute_ppo_loss(old_probs, new_probs, advantages, epsilon=0.2):
-    ratio = new_probs / old_probs
-    clipped_ratio = torch.clamp(ratio, 1 - epsilon, 1 + epsilon)
-    return -torch.min(ratio * advantages, clipped_ratio * advantages).mean()
+    # Bellekteki toplam deneyim sayısını alma
+    def __len__(self):
+        return len(self.buffer)
 
-# Performans verileri için liste
-episode_rewards = []
-average_rewards = []
-policy_losses = []
-value_losses = []
 
-# Eğitim döngüsü
-for episode in range(num_episodes):
-    obs, _ = env.reset()  # Yeni Gym API'sine uygun reset
-    log_probs = []
-    values = []
-    rewards = []
-    dones = []
-    states = []
-    actions = []  # Seçilen eylemleri saklamak için liste
+# DQN Ajanı
+class DQNAgent:
+    def __init__(self, state_dim, action_dim, lr=1e-3, gamma=0.99, epsilon=1.0, epsilon_decay=0.995, epsilon_min=0.01):
+        self.state_dim = state_dim  # Durum boyutu
+        self.action_dim = action_dim  # Eylem boyutu
+        self.gamma = gamma  # Gelecekteki ödüllerin indirim oranı
+        self.epsilon = epsilon  # Keşif oranı (epsilon-greedy)
+        self.epsilon_decay = epsilon_decay  # Epsilon değerinin azalması
+        self.epsilon_min = epsilon_min  # Epsilon için minimum değer
+        self.replay_buffer = ReplayBuffer(20000)  # Deneyim belleği
+        self.batch_size = 64  # Eğitim için minibatch boyutu
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")  # Cuda desteği
 
-    for t in range(max_steps_per_episode):  # Maksimum adım sayısı
-        state = torch.tensor(np.array(obs), dtype=torch.float32)
-        states.append(state)
+        # Model ve hedef modelin oluşturulması
+        self.model = DQN(state_dim, action_dim)  # Q ağı
+        self.model.to("cuda" if torch.cuda.is_available() else "cpu")
+        self.target_model = DQN(state_dim, action_dim)  # Hedef Q ağı
+        self.target_model.to("cuda" if torch.cuda.is_available() else "cpu")
+        self.optimizer = Adam(self.model.parameters(), lr=lr)  # Adam optimizasyonu
+        self.update_target_model()
 
-        action_probs = policy_net(state)
-        action_dist = torch.distributions.Categorical(action_probs)
-        action = action_dist.sample()
+    # Hedef modelini güncelleme
+    def update_target_model(self):
+        self.target_model.load_state_dict(self.model.state_dict())
 
-        log_prob = action_dist.log_prob(action)
-        log_probs.append(log_prob.unsqueeze(0))  # Boyut ekledik
-        values.append(value_net(state))
-        actions.append(action.item())  # Seçilen eylemi ekle
+    # Eylem seçimi
+    def select_action(self, state):
+        # Eğer keşif yapma oranı (epsilon) ile seçim yapılıyorsa, rastgele eylem seç
+        if np.random.rand() < self.epsilon:
+            return np.random.randint(self.action_dim)
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)  # Durumu tensöre dönüştür
+        with torch.no_grad():
+            q_values = self.model(state)  # Modelden Q-değerlerini al
+        return q_values.argmax().item()  # En yüksek Q-değerine sahip eylemi seç
 
-        obs, reward, terminated, truncated, info = env.step(action.item())
-        done = terminated or truncated
+    # Eğitim işlemi
+    def train(self):
+        # Eğer yeterli deneyim yoksa eğitim yapılmaz
+        if len(self.replay_buffer) < self.batch_size:
+            return
 
-        rewards.append(reward)
-        dones.append(done)
+        # Deneyimlerden rastgele bir minibatch seçme
+        state, action, reward, next_state, done = self.replay_buffer.sample(self.batch_size)
 
-        if done:
-            break
+        state = torch.FloatTensor(state).to(self.device)
+        next_state = torch.FloatTensor(next_state).to(self.device)
+        action = torch.LongTensor(action).to(self.device)
+        reward = torch.FloatTensor(reward).to(self.device)
+        done = torch.FloatTensor(done).to(self.device)
 
-    # Ödülleri hesapla
-    total_reward = sum(rewards)
-    episode_rewards.append(total_reward)
+        # Q-değerlerinin hesaplanması
+        q_values = self.model(state)
+        next_q_values = self.target_model(next_state)
+        q_value = q_values.gather(1, action.unsqueeze(1)).squeeze(1)
+        next_q_value = next_q_values.max(1)[0]
+        expected_q_value = reward + self.gamma * next_q_value * (1 - done)
 
-    if episode >= 100:
-        avg_reward = np.mean(episode_rewards[-100:])
-        average_rewards.append(avg_reward)
-    else:
-        average_rewards.append(total_reward)
+        # Kayıp fonksiyonu (Mean Squared Error)
+        loss = F.mse_loss(q_value, expected_q_value.detach())
 
-    returns = []
-    R = 0
-    for reward, done in zip(reversed(rewards), reversed(dones)):
-        if done:
-            R = 0
-        R = reward + gamma * R
-        returns.insert(0, R)
+        # Geri yayılım (backpropagation) adımları
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
 
-    returns = torch.tensor(returns, dtype=torch.float32)
-    values = torch.cat(values).squeeze()
-    log_probs = torch.cat(log_probs)  # Artık sorun çıkmamalı
-    actions = torch.tensor(actions, dtype=torch.long)  # Tam sayı tensor
+        # Epsilon değeri zamanla azalır
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
 
-    advantages = returns - values.detach()
 
-    # Politika ağı güncelleme
-    new_action_probs = policy_net(torch.stack(states))
-    new_action_dist = torch.distributions.Categorical(new_action_probs)
-    new_log_probs = new_action_dist.log_prob(actions)  # Eylemleri kullan
 
-    policy_loss = compute_ppo_loss(
-        old_probs=torch.exp(log_probs),
-        new_probs=torch.exp(new_log_probs),
-        advantages=advantages
-    )
-    policy_losses.append(policy_loss.item())
+# Ajanı eğitme
+env = gym.make("MountainCar-v0")  # MountainCar ortamını oluşturma
+state_dim = env.observation_space.shape[0]  # Durum boyutu
+action_dim = env.action_space.n  # Eylem sayısı
+agent = DQNAgent(state_dim, action_dim)  # DQN ajanı
 
-    policy_optimizer.zero_grad()
-    policy_loss.backward()
-    policy_optimizer.step()
+episodes = 5000  # Ajanı 5000 bölüm boyunca eğit
+episode_rewards = []  # Ödülleri saklama
 
-    # Değer ağı güncelleme
-    value_loss = nn.MSELoss()(values, returns)
-    value_losses.append(value_loss.item())
+for episode in range(episodes):
+    state, _ = env.reset()  # Başlangıç durumu
+    episode_reward = 0  # Bölüm ödülü
+    done = False  # Bölümün bitip bitmediğini kontrol et
 
-    value_optimizer.zero_grad()
-    value_loss.backward()
-    value_optimizer.step()
+    while not done:
+        action = agent.select_action(state)  # Ajanın eylemi seçmesi
+        next_state, reward, done, trunc, _ = env.step(action)  # Ortamdan çıktı al
+        done = done or trunc  # Bitiş durumu kontrolü
+        agent.replay_buffer.push(state, action, reward, next_state, done)  # Deneyimi belleğe ekle
+        state = next_state  # Durumu güncelle
+        episode_reward += reward  # Ödülü güncelle
 
-    # Bölüm ilerlemesini yazdır
-    if episode % update_interval == 0:
-        print(f"Episode {episode}, Policy Loss: {policy_loss.item():.4f}, Value Loss: {value_loss.item():.4f}, Total Reward: {total_reward:.2f}")
+        agent.train()  # Ajanı eğit
 
-# Eğitim performansını görselleştir
-fig, ax = plt.subplots(2, 1, figsize=(10, 12))
+    episode_rewards.append(episode_reward)  # Bölüm ödülünü listeye ekle
+    agent.update_target_model()  # Hedef modelini güncelle
+    print(f"Episode {episode + 1}: {episode_reward}")  # Bölüm sonucunu yazdır
 
-# Ortalama ödülleri çiz
-ax[0].plot(average_rewards, label="Average Rewards (100 Episodes)")
-ax[0].set_xlabel("Episode")
-ax[0].set_ylabel("Average Reward")
-ax[0].set_title("PPO Training - Average Rewards")
-ax[0].legend()
-
-# Kayıpları çiz
-ax[1].plot(policy_losses, label="Policy Loss")
-ax[1].plot(value_losses, label="Value Loss")
-ax[1].set_xlabel("Episode")
-ax[1].set_ylabel("Loss")
-ax[1].set_title("PPO Training - Losses")
-ax[1].legend()
-
-plt.tight_layout()
+# Ödül grafiğini çizme
+plt.plot(episode_rewards)
+plt.xlabel("Bölümler")
+plt.ylabel("Ödüller")
 plt.show()
 
-env.close()
+# Video kaydı ve görüntüleme (grafiksel render)
+env = gym.make("MountainCar-v0", render_mode="rgb_array")
+frames = []
+state, _ = env.reset()
+done = False
+while not done:
+    action = agent.select_action(state)
+    next_state, reward, done, trunc, _ = env.step(action)
+    frames.append(env.render())
+    state = next_state
+
+# Video animasyonu oluşturma
+fig = plt.figure()
+ani = animation.ArtistAnimation(fig, frames, interval=50, blit=True)
+display(HTML(ani.to_html5_video()))
+
